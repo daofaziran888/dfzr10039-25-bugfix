@@ -224,6 +224,7 @@ class ExtractRule:
     clean_regex: str = ""
     extract_order: int = 0
     status: str = "草稿"
+    url_pattern: str = ""  # 适用URL模式（fnmatch），空串表示适用于站点全部页面
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> ExtractRule:
@@ -236,7 +237,20 @@ class ExtractRule:
             clean_regex=str(row.get("清洗正则", "")),
             extract_order=int(row.get("抽取顺序", 0)),
             status=str(row.get("status", "草稿")),
+            url_pattern=str(row.get("适用URL模式", "")),
         )
+
+    def applies_to(self, site_domain: str, url: str) -> bool:
+        """判断规则是否适用指定页面：生效中、站点匹配且 URL 模式命中。"""
+        if self.status != "生效中":
+            return False
+        if self.target_site and site_domain and self.target_site != site_domain:
+            return False
+        if self.url_pattern:
+            from fnmatch import fnmatchcase
+            if not fnmatchcase(url, self.url_pattern):
+                return False
+        return True
 
 
 @dataclass
@@ -308,9 +322,12 @@ class StorageBatch:
     stored_at: str = ""
     status: str = "采集中"
     records: list[CleanedContent] = field(default_factory=list)
+    receipt_id: str = ""           # 空结果回执编号：批次行数与落库范围以回执为准
+    page_scope: list[str] = field(default_factory=list)  # 实际落库的页面范围
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> StorageBatch:
+        scope_raw = str(row.get("落库范围", "") or "")
         return cls(
             batch_id=str(row.get("批次编号", "")),
             source_job_id=str(row.get("来源作业", "")),
@@ -321,11 +338,123 @@ class StorageBatch:
             checksum=str(row.get("校验摘要", "")),
             stored_at=str(row.get("入库时间", "")),
             status=str(row.get("status", "采集中")),
+            receipt_id=str(row.get("回执编号", "") or ""),
+            page_scope=[u for u in scope_raw.split(",") if u],
         )
 
     def compute_checksum(self) -> str:
         payload = json.dumps([r.fields for r in self.records], sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# 空结果回执与日报取数
+# ---------------------------------------------------------------------------
+
+class PageOutcome(str, Enum):
+    """页面级采集结论：只有用过适用规则并留有来源的页面才能认定为空或有结果。"""
+    PARSED = "已解析"        # 适用规则命中并产出数据行
+    EMPTY = "空页"           # 适用规则命中但页面确无匹配内容（零行依据）
+    NO_RULE = "缺规则"       # 没有适用的解析规则，页面被跳过（保留原因，不算完成）
+    READ_FAILED = "读取失败"  # 页面读取中断/失败（保留原因，不算完成）
+    PARSE_FAILED = "解析失败"  # 规则适用但解析产生错误
+
+
+@dataclass
+class PageReceipt:
+    """空结果回执的页面条目：交代一个入口页面跑没跑过、结果如何、原因是什么。"""
+    page_url: str
+    job_id: str
+    outcome: PageOutcome
+    rule_id: str = ""       # 实际适用的解析规则（来源证据）
+    row_count: int = 0
+    reason: str = ""        # 缺规则/读取失败等原因
+    source: str = ""        # 页面来源（本地路径或 URL）
+    recorded_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @property
+    def conclusive(self) -> bool:
+        """是否有结论：只有实际用过适用规则的页面（有结果或确为空）才算跑过。"""
+        return self.outcome in (PageOutcome.PARSED, PageOutcome.EMPTY)
+
+    @property
+    def pending(self) -> bool:
+        """是否待核：缺规则或读取失败，等待补规则或恢复后重试。"""
+        return self.outcome in (PageOutcome.NO_RULE, PageOutcome.READ_FAILED)
+
+
+@dataclass
+class CollectionReceipt:
+    """空结果回执：一次采集运行全部入口页面的交代，批次存储与日报取数共用。"""
+    receipt_id: str
+    job_id: str
+    pages: list[PageReceipt] = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @property
+    def completed_pages(self) -> list[PageReceipt]:
+        """跑过的页面：有结论（已解析或空页）。"""
+        return [p for p in self.pages if p.conclusive]
+
+    @property
+    def pending_pages(self) -> list[PageReceipt]:
+        """还没完成的页面：缺规则或读取失败，原因已保留。"""
+        return [p for p in self.pages if p.pending]
+
+    @property
+    def failed_pages(self) -> list[PageReceipt]:
+        return [p for p in self.pages if p.outcome == PageOutcome.PARSE_FAILED]
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.pending_pages and not self.failed_pages
+
+    @property
+    def parsed_row_count(self) -> int:
+        return sum(p.row_count for p in self.pages if p.outcome == PageOutcome.PARSED)
+
+    @property
+    def scope(self) -> list[str]:
+        """落库范围：实际跑过并有来源的页面。"""
+        return [p.page_url for p in self.pages if p.conclusive]
+
+    def page(self, page_url: str) -> PageReceipt | None:
+        for p in self.pages:
+            if p.page_url == page_url:
+                return p
+        return None
+
+
+@dataclass
+class ReportLine:
+    """日报取数清单的一行：采用的批次明细、来源版本、页面范围与验收状态。"""
+    batch_id: str
+    source_version: str     # 来源版本：批次校验摘要
+    page_url: str = ""      # 页面范围（空串表示批次级兼容行）
+    rule_id: str = ""
+    row_count: int = 0
+    acceptance: str = "待验收"  # 已发布 / 待验收 / 待核 / 已确认
+    reason: str = ""
+
+
+@dataclass
+class DailyReport:
+    """日报出表结果：使用的批次明细、来源版本与发布范围的快照，生成后不可改。"""
+    report_id: str
+    job_id: str
+    lines: list[ReportLine] = field(default_factory=list)
+    publish_scope: list[str] = field(default_factory=list)  # 发布范围 = 采用批次的落库范围
+    adopted_batch_id: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status: str = "已出表"
+
+    @property
+    def published_rows(self) -> int:
+        return sum(l.row_count for l in self.lines if l.acceptance == "已发布")
+
+    @property
+    def pending_rows(self) -> int:
+        return sum(l.row_count for l in self.lines if l.acceptance in ("待验收", "待核"))
 
 
 @dataclass
